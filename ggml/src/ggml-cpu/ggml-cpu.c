@@ -2526,6 +2526,16 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         // all our threads onto the first 4 cores which results in terrible performance with
         // n_threads > 4
         #if _WIN32_WINNT >= 0x0602
+        #ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
+        // MinGW may lack these definitions
+        typedef struct _THREAD_POWER_THROTTLING_STATE {
+            ULONG Version;
+            ULONG ControlMask;
+            ULONG StateMask;
+        } THREAD_POWER_THROTTLING_STATE;
+        #define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+        #define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
+        #endif
         THREAD_POWER_THROTTLING_STATE t;
         ZeroMemory(&t, sizeof(t));
         t.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
