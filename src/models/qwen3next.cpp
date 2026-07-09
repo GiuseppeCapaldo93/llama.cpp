@@ -23,6 +23,7 @@ void llama_model_qwen3next::load_arch_hparams(llama_model_loader & ml) {
     }
 
     switch (hparams.n_layer()) {
+        case 40: type = LLM_TYPE_35B_A3B; break;
         case 48: type = LLM_TYPE_80B_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
