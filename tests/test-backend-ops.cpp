@@ -6944,6 +6944,47 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_mamba2_post_fusion : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+
+    test_mamba2_post_fusion(int64_t head_dim, int64_t n_head)
+        : head_dim(head_dim), n_head(n_head) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(head_dim, n_head);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MAMBA2_POST_FUSION";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = head_dim * n_head;
+
+        ggml_tensor * z_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * n);
+        ggml_tensor * z = ggml_view_4d(
+            ctx, z_storage, head_dim, n_head, 1, 1,
+            head_dim * sizeof(float), 2 * n * sizeof(float), 2 * n * sizeof(float), 0);
+
+        ggml_tensor * y_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * n);
+        ggml_tensor * y = ggml_view_4d(
+            ctx, y_storage, head_dim, n_head, 1, 1,
+            head_dim * sizeof(float), 2 * n * sizeof(float), 2 * n * sizeof(float), 0);
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_head);
+        ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head);
+
+        ggml_tensor * mixed = ggml_add(ctx, y, ggml_mul(ctx, x, d));
+        return ggml_swiglu_split(ctx, ggml_cont(ctx, z), mixed);
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -9573,6 +9614,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    test_cases.emplace_back(new test_mamba2_post_fusion(80, 96)); // Nemotron-4B decode tail
+
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 256, 64,  8, 2, 32, 4)); // Falcon-H1
@@ -10923,6 +10966,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
 
+    // Real Nemotron3-Nano-4B decode shapes: short K (k=3136 -> 98 blocks/row) with
+    // large M. This is the regime batch-1 generation actually runs in, and it is
+    // NOT covered by the 4096x14336 case above (448 blocks/row), which sits at
+    // ~87% of memory roofline while these do not.
+    for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t m : {5120, 12544, 17504}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, 3136, {1, 1}, {1, 1}));
+        }
+        // same byte volume as m=17504,k=3136 but with long K, to separate
+        // "short K" from "large M" as the cause of any deficit
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 3136, 1, 17504, {1, 1}, {1, 1}));
+    }
+
     for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -11118,6 +11174,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+
+    // Nemotron3-Nano-4B batch-1 decode, exact shapes taken from the real graph
+    // (optools/results/graphdump_shapes.log). Per layer per token the recurrent
+    // state (96 heads x 80 head_dim x 128 d_state = 983040 f32 = 3.75 MB) is
+    // scaled and copied in addition to being scanned, and there are 21 such
+    // layers - roughly 315 MB/token of pure state bookkeeping traffic.
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 96, 8, 1, 1)); // n4b generate
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {983040, 1, 1, 1}));       // n4b state scale
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {983040, 1, 1, 1})); // n4b state copy
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {29184, 1, 1, 1}));        // n4b conv state scale
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {29184, 1, 1, 1}));  // n4b conv state copy
+
+    // Remaining Nemotron3-Nano-4B hybrid-path ops at their real decode shapes.
+    // d_inner=7680 plus 2*n_group*d_state (2*8*128=2048) gives the 9728 conv channels.
+    test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4, 9728, 1, 1}, {4, 9728, 1, 1}));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 9728, 1, 1}, 1, 0));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {80, 96, 1, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_unary(GGML_UNARY_OP_SILU, GGML_TYPE_F32, {9728, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {9728, 1, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {3136, 1, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {3136, 1, 1, 1}));
 
     // acc
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
