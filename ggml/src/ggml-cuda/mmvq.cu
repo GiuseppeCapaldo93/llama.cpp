@@ -616,9 +616,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-// Experimental MMVQ launch-config selector for the RDNA3/RDNA4 tables:
-//   0 = upstream        (nwarps = 8, rows_per_block = 1)
-//   1 = single warp     (nwarps = 1, rows_per_block = 4)
+// Experimental MMVQ launch-config selector. Applies to the RDNA3 table ONLY; every
+// other device (NVIDIA, GCN, RDNA1/2/4, CDNA) keeps upstream behaviour unchanged.
+//   0 = upstream        (nwarps = 8, rows_per_block = 1 for the legacy quants)
+//   1 = single warp     (nwarps = 1, rows_per_block = 1 via the small_k path)
 //   2 = Vulkan-shaped   (nwarps = 1, rows_per_block = 2, warp-only reduction) [default]
 //
 // The upstream nwarps=8 whitelist for the legacy quants was tuned on a W7900 (48 WGP).
@@ -629,10 +630,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 // subgroup-only reduction; matching that shape measures ~16-19% faster end to end on
 // Nemotron (q5_0-dominated) and is neutral-to-positive on dense q4_K/q5_K models.
 // Set GGML_CUDA_MMVQ_CFG=0 to restore the upstream launch geometry.
-static int ggml_cuda_mmvq_cfg() {
+// Returns -1 when the selector does not apply to this device.
+static int ggml_cuda_mmvq_cfg(mmvq_parameter_table_id table_id) {
+    if (table_id != MMVQ_PARAMETERS_RDNA3_0) {
+        return -1;
+    }
     static const int cfg = [] {
         const char * s = getenv("GGML_CUDA_MMVQ_CFG");
-        return s ? atoi(s) : 2;
+        return (s && *s) ? atoi(s) : 2;
     }();
     return cfg;
 }
@@ -1138,12 +1143,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
-        static const int small_k_override = [] {
-            const char * s = getenv("GGML_CUDA_SMALL_K");
-            return s ? atoi(s) : -1;
-        }();
-        if (small_k_override == 0 || ggml_cuda_mmvq_cfg() != 1) {
-            use = false;
+        // RDNA3 with the selector active: cfg 1 forces the single-warp/one-row shape
+        // for the types the table runs with nwarps > 1. Upstream excludes RDNA from
+        // small_k below, so this has to decide here; any other cfg leaves it off.
+        const int mmvq_cfg = ggml_cuda_mmvq_cfg(table_id);
+        if (mmvq_cfg >= 0) {
+            return mmvq_cfg == 1 && nwarps > 1;
         }
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
@@ -1218,6 +1223,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
+                // The GB10 promotion list is also the set that changes under the RDNA3
+                // selector (legacy quants: nwarps 8 -> 1; q4_K/q5_K/q6_K: rows 1 -> 2), so
+                // q2_K/q3_K and the IQ types are left at upstream geometry on RDNA3 as well.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
@@ -1235,7 +1243,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
             if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
-            } else if (ggml_cuda_mmvq_cfg() == 2 || should_halve_iters()) {
+            } else if (ggml_cuda_mmvq_cfg(table_id) == 2 || should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
             } else {
                 launch(std::false_type{}, std::false_type{});
