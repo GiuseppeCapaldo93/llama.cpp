@@ -341,13 +341,15 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         // On an integrated GPU the CPU and the GPU share a single power/thermal budget.
         // ROCclr enables "active wait" by default (hip_context.cpp: SetActiveWait(true)),
-        // so every synchronization spins a CPU core. On a discrete card that only costs
-        // idle CPU, but on an APU the spinning core consumes package power that the GPU
-        // would otherwise use for its own clocks, which lowers sustained token throughput.
-        // llama.cpp's Vulkan backend blocks on fences instead and uses ~2.4x less CPU here.
+        // so every host-side synchronization spins a CPU core (platform/command.cpp,
+        // Event::awaitCompletion yields in a tight loop). On a discrete card that only
+        // costs idle CPU, but on an APU the spinning core consumes package power that the
+        // GPU would otherwise use for its own clocks. llama.cpp's Vulkan backend blocks
+        // on fences instead.
         //
         // Default to blocking sync on integrated devices; GGML_CUDA_ACTIVE_WAIT=1 restores
-        // the spinning behaviour.
+        // the spinning behaviour. Measured on a Radeon 780M: throughput neutral, see
+        // scripts/local-780m for the CPU-time-per-token comparison.
         {
             const char * env = getenv("GGML_CUDA_ACTIVE_WAIT");
             const bool force_spin = env != nullptr && atoi(env) != 0;
@@ -3468,7 +3470,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     //   cont(z), view(y_ssm), x*d, y_ssm + x*d, silu(z) * (...)
     // The views are contiguous for single-token decode, so all four kernels can
     // be replaced by one without changing the graph used for prompt processing.
-    if (ggml_can_fuse_subgraph(
+    // Batch guard: is_flat_f32_decode() requires ne[2] == ne[3] == 1, so multi-token
+    // ubatches (ne[2] > 1) and multi-sequence decode (ne[3] > 1) never match.
+    // GGML_CUDA_DISABLE_MAMBA2_FUSION=1 turns only this fusion off (A/B toggle).
+    static const bool disable_mamba2_fusion = getenv("GGML_CUDA_DISABLE_MAMBA2_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MAMBA2_FUSION"));
+    if (!disable_mamba2_fusion && ggml_can_fuse_subgraph(
             cgraph, i,
             { GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_GLU },
             { i + 1, i + 4 })) {
