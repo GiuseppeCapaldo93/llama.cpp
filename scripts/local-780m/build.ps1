@@ -89,7 +89,7 @@ $cfgArgs = @(
     "-DCMAKE_CXX_COMPILER=$clangxx",
     "-DCMAKE_PREFIX_PATH=$sdkFwd",
     "-DGGML_HIP=ON",
-    "-DAMDGPU_TARGETS=$Arch",
+    "-DGPU_TARGETS=$Arch",
     "-DCMAKE_HIP_ARCHITECTURES=$Arch",
     "-DGGML_HIP_GRAPHS=ON",
     "-DGGML_HIP_NO_VMM=ON",
@@ -105,8 +105,11 @@ $cfgArgs = @(
 $bldArgs = "--build `"$build`" -j $Jobs"
 if ($Targets.Count -gt 0) { $bldArgs += " --target " + ($Targets -join " ") }
 
+# Note: do NOT export ROCM_PATH. clang treats it as authoritative and expects
+# <ROCM_PATH>\amdgcn\bitcode, but TheRock ships the device libraries under
+# lib\llvm\amdgcn\bitcode, which clang only finds via its install-relative lookup.
 $cmd = "call `"$vcvars`" -vcvars_ver=14.44 >nul 2>&1 && " +
-       "set `"HIP_PATH=$sdk`" && set `"ROCM_PATH=$sdk`" && " +
+       "set `"HIP_PATH=$sdk`" && " +
        "set `"PATH=$sdk\bin;$core\bin;$libs\bin;%PATH%`" && " +
        "`"$cmake`" $cfgArgs && `"$cmake`" $bldArgs"
 
