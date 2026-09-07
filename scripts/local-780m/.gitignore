@@ -1,0 +1,6 @@
+# Research harnesses, captures, logs and results for the Radeon 780M work (~2.3 GB, not for git).
+# Relocated from %USERPROFILE%\llm-bench on 2026-09-07; see optools/README.md.
+# Use 'git add -f' if you decide to version the two narrative documents.
+optools/
+HANDOFF.md
+HANDOVER.md
