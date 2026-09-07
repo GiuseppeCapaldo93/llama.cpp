@@ -81,7 +81,7 @@ for ($round = 1; $round -le $Rounds; $round++) {
 }
 Remove-Item "Env:$EnvName" -ErrorAction SilentlyContinue
 
-function Median([double[]] $v) { $s = $v | Sort-Object; if ($s.Count % 2) { $s[[int]($s.Count / 2)] } else { ($s[$s.Count/2 - 1] + $s[$s.Count/2]) / 2 } }
+function Median([double[]] $v) { $s = @($v | Sort-Object); $n = $s.Count; if ($n % 2) { $s[[math]::Floor($n / 2)] } else { ($s[$n/2 - 1] + $s[$n/2]) / 2 } }
 
 ""
 "=== summary (median of $Rounds rounds) ==="

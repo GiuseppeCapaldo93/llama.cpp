@@ -627,8 +627,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 // output row and then pays a full 8-warp shared-memory reduction, which costs more than
 // the dot product itself. llama.cpp's own Vulkan backend runs the same mat-vec on this
 // hardware with one subgroup per workgroup and 2 rows per workgroup, using a
-// subgroup-only reduction; matching that shape measures ~16-19% faster end to end on
-// Nemotron (q5_0-dominated) and is neutral-to-positive on dense q4_K/q5_K models.
+// subgroup-only reduction. Matching that shape for the legacy quants measured +16-19%
+// end to end on Nemotron-3-Nano-4B and +37% on Nemotron-3-Nano-30B-A3B (both
+// q5_0/q8_0-dominated). It applies only to the types whose nwarps changes; K-quant
+// models (Gemma-4-12B Q4_K_M/Q5_K_M) keep upstream geometry, see the dispatch below.
 // Set GGML_CUDA_MMVQ_CFG=0 to restore the upstream launch geometry.
 // Returns -1 when the selector does not apply to this device.
 static int ggml_cuda_mmvq_cfg(mmvq_parameter_table_id table_id) {
@@ -1241,9 +1243,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
+            // On RDNA3 the selector re-shapes only the types whose nwarps it changes (the
+            // 8-warp legacy-quant whitelist). Widening K-quants to 2 rows as well measured
+            // -6.5% on Gemma-4-12B Q4_K_M and -0.7% on Q5_K_M (2026-09-07, 3 rotated
+            // rounds), so q4_K/q5_K/q6_K keep upstream geometry.
+            constexpr bool c_rdna3_reshaped =
+                calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA3_0, false, true) !=
+                calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA3_0, false, false);
+
             if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
-            } else if (ggml_cuda_mmvq_cfg(table_id) == 2 || should_halve_iters()) {
+            } else if ((c_rdna3_reshaped && ggml_cuda_mmvq_cfg(table_id) == 2) || should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
             } else {
                 launch(std::false_type{}, std::false_type{});
