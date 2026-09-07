@@ -169,7 +169,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
     return sumi * d4d8 + m4s8 / (QI8_1 / (vdr * QR4_1));
 }
 
-#define VDR_Q5_0_Q8_1_MMVQ 2
+#define VDR_Q5_0_Q8_1_MMVQ 4
 #define VDR_Q5_0_Q8_1_MMQ  4
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_impl(
@@ -240,7 +240,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
 }
 
-#define VDR_Q8_0_Q8_1_MMVQ 2
+#define VDR_Q8_0_Q8_1_MMVQ 4
 #define VDR_Q8_0_Q8_1_MMQ 8
 
 template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
@@ -501,7 +501,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
     return d3*d8 * sumi;
 }
 
-#define VDR_Q4_K_Q8_1_MMVQ 2
+#define VDR_Q4_K_Q8_1_MMVQ 4
 #define VDR_Q4_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -557,7 +557,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q5_K_Q8_1_MMVQ 2
+#define VDR_Q5_K_Q8_1_MMVQ 4
 #define VDR_Q5_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -920,21 +920,21 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
 
-    int    v[2];
-    int    u[2*QR4_K];
-    float d8[QR4_K];
+    // With vdr == 4 a single thread handles the two sub-lanes that vdr == 2 split
+    // across threads j = 2t and j = 2t+1. Those read adjacent 32 bit words and share
+    // bq8_offset -- and therefore the scales -- so the two 32 bit loads of the q4_K
+    // quants become one 64 bit load. sizeof(block_q4_K) == 144 and qs starts at
+    // offset 16, so these addresses are always 16 byte aligned.
+    // The q8_1 side deliberately keeps 32 bit loads: sizeof(block_q8_1) == 36 with
+    // qs at offset 4, so its address is only 4 byte aligned.
+    const int t          = iqs / 4;                   // 0..7
+    const int bq8_offset = QR4_K * (t / 2);           // 0,0,2,2,4,4,6,6
+    const int q4_byte    = 16*bq8_offset + 8*(t % 2);
 
-    // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
-    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
-
-    // iqs = 0....3 -> bq8_offset = 0, want q4_offset = 0, 4, 8, 12
-    // iqs = 4....7 -> bq8_offset = 2, want q4_offset = 32, 36, 40, 44
-    // iqs = 8...11 -> bq8_offset = 4, want q4_offset = 64, 68, 72, 76
-    // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
-
-    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    v[0] = q4[0];
-    v[1] = q4[4];
+    int vl[2];
+    int vh[2];
+    ggml_cuda_memcpy_1<8>(vl, bq4_K->qs + q4_byte);
+    ggml_cuda_memcpy_1<8>(vh, bq4_K->qs + q4_byte + 16);
 
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
@@ -949,16 +949,28 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
+    int   ua[2*QR4_K];
+    int   ub[2*QR4_K];
+    float d8[QR4_K];
+
+    const int q8_int_off = (2*t) % 4;
+
+#pragma unroll
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
         d8[i] = __low2float(bq8i->ds);
 
-        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
-        u[2*i+0] = q8[0];
-        u[2*i+1] = q8[4];
+        ua[2*i+0] = get_int_b4(bq8i->qs, q8_int_off + 0);
+        ub[2*i+0] = get_int_b4(bq8i->qs, q8_int_off + 1);
+        ua[2*i+1] = get_int_b4(bq8i->qs, q8_int_off + 4);
+        ub[2*i+1] = get_int_b4(bq8i->qs, q8_int_off + 5);
     }
 
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    const int va[2] = { vl[0], vh[0] };
+    const int vb[2] = { vl[1], vh[1] };
+
+    return vec_dot_q4_K_q8_1_impl_vmmq(va, ua, sc, m, bq4_K->dm, d8)
+         + vec_dot_q4_K_q8_1_impl_vmmq(vb, ub, sc, m, bq4_K->dm, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
@@ -966,20 +978,33 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 
     const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
 
-    int   vl[2];
-    int   vh[2];
-    int    u[2*QR5_K];
-    float d8[QR5_K];
+    // Same transformation as vec_dot_q4_K_q8_1: with vdr == 4 a single thread
+    // covers the two sub-lanes that vdr == 2 split across threads. They read
+    // adjacent 32 bit words and share bq8_offset (hence the scales and the qh
+    // shift), so BOTH the qs and the qh load pairs widen to 64 bit.
+    // sizeof(block_q5_K) == 176 with qh at +16 and qs at +48, so both arrays are
+    // 16 byte aligned and every int2 below is naturally aligned.
+    // The q8_1 side keeps 32 bit loads: sizeof(block_q8_1) == 36 with qs at +4,
+    // so its address is only 4 byte aligned.
+    const int t          = iqs / 4;                   // 0..7
+    const int bq8_offset = QR5_K * (t / 2);           // 0,0,2,2,4,4,6,6
+    const int ql_byte    = 16*bq8_offset + 8*(t % 2);
+    const int qh_byte    = 8*(t % 2);
 
-    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
-    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+    int qlp[2];
+    int qhp[2];
+    int qlp_hi[2];
+    int qhp_hi[2];
+    ggml_cuda_memcpy_1<8>(qlp,    bq5_K->qs + ql_byte);
+    ggml_cuda_memcpy_1<8>(qlp_hi, bq5_K->qs + ql_byte + 16);
+    ggml_cuda_memcpy_1<8>(qhp,    bq5_K->qh + qh_byte);
+    ggml_cuda_memcpy_1<8>(qhp_hi, bq5_K->qh + qh_byte + 16);
 
-    vl[0] = ql[0];
-    vl[1] = ql[4];
-
-    vh[0] = qh[0] >> bq8_offset;
-    vh[1] = qh[4] >> bq8_offset;
+    // sub-lane A == old thread 2t, sub-lane B == old thread 2t+1
+    const int vlA[2] = { qlp[0], qlp_hi[0] };
+    const int vlB[2] = { qlp[1], qlp_hi[1] };
+    const int vhA[2] = { qhp[0] >> bq8_offset, qhp_hi[0] >> bq8_offset };
+    const int vhB[2] = { qhp[1] >> bq8_offset, qhp_hi[1] >> bq8_offset };
 
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
@@ -994,17 +1019,25 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
+    int   ua[2*QR5_K];
+    int   ub[2*QR5_K];
+    float d8[QR5_K];
+
+    const int q8_int_off = (2*t) % 4;
+
 #pragma unroll
     for (int i = 0; i < QR5_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
         d8[i] = __low2float(bq8i->ds);
 
-        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
-        u[2*i+0] = q8[0];
-        u[2*i+1] = q8[4];
+        ua[2*i+0] = get_int_b4(bq8i->qs, q8_int_off + 0);
+        ub[2*i+0] = get_int_b4(bq8i->qs, q8_int_off + 1);
+        ua[2*i+1] = get_int_b4(bq8i->qs, q8_int_off + 4);
+        ub[2*i+1] = get_int_b4(bq8i->qs, q8_int_off + 5);
     }
 
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    return vec_dot_q5_K_q8_1_impl_vmmq(vlA, vhA, ua, sc, m, bq5_K->dm, d8)
+         + vec_dot_q5_K_q8_1_impl_vmmq(vlB, vhB, ub, sc, m, bq5_K->dm, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(

@@ -6,6 +6,34 @@
 #include <cstdint>
 #include <type_traits>
 
+// Wave size for the kernels in THIS translation unit.
+#if defined(GGML_MMVQ_WAVE64)
+#  define MMVQ_WARP_SIZE 64
+#else
+#  define MMVQ_WARP_SIZE ggml_cuda_get_physical_warp_size()
+#endif
+
+#if defined(GGML_MMVQ_WAVE64)
+static __device__ __forceinline__ float mmvq_readlane_f32(float x, int lane) {
+    return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(x), lane));
+}
+
+template <int width>
+static __device__ __forceinline__ float mmvq_warp_reduce_sum(float x) {
+    static_assert(width == 64, "wave64 mmvq reduction expects width 64");
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_xor(x, offset, 32);
+    }
+    return mmvq_readlane_f32(x, 0) + mmvq_readlane_f32(x, 32);
+}
+#else
+template <int width>
+static __device__ __forceinline__ float mmvq_warp_reduce_sum(float x) {
+    return warp_reduce_sum<width>(x);
+}
+#endif
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -471,11 +499,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
                 case GGML_TYPE_Q8_0:
-                    return 8;
+                    return (halve_iters || small_k) ? 1 : 8;
                 case GGML_TYPE_Q6_K:
                     return 2;
                 case GGML_TYPE_IQ4_NL:
-                    return 8;
+                    return (halve_iters || small_k) ? 1 : 8;
                 default:
                     return 1;
             }
@@ -533,7 +561,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -550,11 +578,28 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
                 return 1;
         }
     }
+    // RDNA3/RDNA4: previously always returned 1 here, making small_k a no-op.
+    if (ncols_dst == 1) {
+        if (halve_iters) {
+            return 2;
+        }
+        if (small_k) {
+            return 1;
+        }
+    }
     return 1;
 }
 
+static int ggml_cuda_mmvq_cfg() {
+    static const int cfg = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_CFG");
+        return s ? atoi(s) : 2;
+    }();
+    return cfg;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*MMVQ_WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -572,8 +617,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, halve_iters);
+    constexpr int warp_size = MMVQ_WARP_SIZE;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -729,10 +774,10 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            tmp[j][i] = mmvq_warp_reduce_sum<warp_size>(tmp[j][i]);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    tmp_gate[j][i] = mmvq_warp_reduce_sum<warp_size>(tmp_gate[j][i]);
                 }
             }
 
@@ -786,7 +831,7 @@ static __global__ void mul_mat_vec_q(
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*MMVQ_WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr,
@@ -802,7 +847,7 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = MMVQ_WARP_SIZE;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -871,10 +916,10 @@ static __global__ void mul_mat_vec_q_moe(
     // Warp-level reduction only - no shared memory needed
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        tmp[i] = mmvq_warp_reduce_sum<warp_size>(tmp[i]);
         if constexpr (has_fusion) {
             if (use_gate) {
-                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+                tmp_gate[i] = mmvq_warp_reduce_sum<warp_size>(tmp_gate[i]);
             }
         }
     }
@@ -937,7 +982,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, halve_iters);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1028,7 +1073,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const int device = ggml_cuda_get_device();
     const int                     cc        = ggml_cuda_info().devices[device].cc;
+#if defined(GGML_MMVQ_WAVE64)
+    const int warp_size = 64;
+    GGML_UNUSED(device);
+#else
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
+#endif
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
@@ -1045,6 +1095,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+
+        static const int small_k_override = [] {
+            const char * s = getenv("GGML_CUDA_SMALL_K");
+            return s ? atoi(s) : -1;
+        }();
+        if (small_k_override == 0 || ggml_cuda_mmvq_cfg() != 1) {
+            use = false;
+        }
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
@@ -1135,7 +1193,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
             if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
-            } else if (should_halve_iters()) {
+            } else if (ggml_cuda_mmvq_cfg() == 2 || should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
             } else {
                 launch(std::false_type{}, std::false_type{});
