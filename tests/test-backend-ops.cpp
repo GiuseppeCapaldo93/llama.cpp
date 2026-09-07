@@ -10970,7 +10970,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // large M. This is the regime batch-1 generation actually runs in, and it is
     // NOT covered by the 4096x14336 case above (448 blocks/row), which sits at
     // ~87% of memory roofline while these do not.
-    for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+    // Only block-32 types: 3136 is not a multiple of QK_K, so K-quants cannot have
+    // this K (and the model's tensors with this shape are q5_0/q8_0 accordingly).
+    for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0}) {
         for (int64_t m : {5120, 12544, 17504}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, 3136, {1, 1}, {1, 1}));
         }
