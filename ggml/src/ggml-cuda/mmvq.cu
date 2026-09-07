@@ -7,6 +7,17 @@
 #include <type_traits>
 
 // Wave size for the kernels in THIS translation unit.
+//
+// ggml_cuda_get_physical_warp_size() hardcodes 32 for gfx10+, which is only the
+// default. When this file is built with -mwavefrontsize64 the kernels actually
+// run 64-wide, and the device-side constant must agree with the host launch
+// geometry or the launch violates __launch_bounds__ and fails.
+//
+// Note: __AMDGCN_WAVEFRONT_SIZE__ cannot be used for this - it has been removed
+// from the toolchain (llvm/llvm-project#164217) and is undefined here, so a
+// feature test on it silently falls through to 32. __builtin_amdgcn_wavefrontsize()
+// does report correctly but is not usable in constexpr/launch_bounds context.
+// The build system therefore defines GGML_MMVQ_WAVE64 alongside the flag.
 #if defined(GGML_MMVQ_WAVE64)
 #  define MMVQ_WARP_SIZE 64
 #else
@@ -14,6 +25,14 @@
 #endif
 
 #if defined(GGML_MMVQ_WAVE64)
+// On RDNA, ds_bpermute_b32 (which backs __shfl_xor) only addresses lanes within
+// a 32-lane half, so __shfl_xor(x, 32, 64) silently returns the lane's own value
+// instead of the peer's. A uniform-value test does not catch this: x += x still
+// yields the right total. With real per-lane partial sums it double-counts each
+// half and drops the other. See ROCm/ROCm#6384.
+//
+// Reduce within each half with the normal butterfly, then combine the two halves
+// with readlane, which can address any lane in the wave.
 static __device__ __forceinline__ float mmvq_readlane_f32(float x, int lane) {
     return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(x), lane));
 }
@@ -578,11 +597,18 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
                 return 1;
         }
     }
-    // RDNA3/RDNA4: previously always returned 1 here, making small_k a no-op.
+    // RDNA3/RDNA4 use nwarps > 1 for the legacy quants, but previously always returned 1 here.
+    // That made the small_k path a no-op: the block still reduced nwarps warps down to a single
+    // output row, so each thread performed one dot product and then paid a full cross-warp
+    // reduction. Widening to one row per warp restores the intended behaviour.
     if (ncols_dst == 1) {
+        // halve_iters selects the Vulkan-shaped config: one warp per block, 2 rows,
+        // warp-only reduction (no shared memory, no __syncthreads).
         if (halve_iters) {
             return 2;
         }
+        // small_k: same single-warp shape but 1 row per block (matches the Vulkan
+        // integer mat-vec pipeline, which uses rm_stdq_int = 1 on AMD).
         if (small_k) {
             return 1;
         }
@@ -590,6 +616,19 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// Experimental MMVQ launch-config selector for the RDNA3/RDNA4 tables:
+//   0 = upstream        (nwarps = 8, rows_per_block = 1)
+//   1 = single warp     (nwarps = 1, rows_per_block = 4)
+//   2 = Vulkan-shaped   (nwarps = 1, rows_per_block = 2, warp-only reduction) [default]
+//
+// The upstream nwarps=8 whitelist for the legacy quants was tuned on a W7900 (48 WGP).
+// On a small RDNA3 part (gfx1103 has 6 WGP) that 256-thread block computes a single
+// output row and then pays a full 8-warp shared-memory reduction, which costs more than
+// the dot product itself. llama.cpp's own Vulkan backend runs the same mat-vec on this
+// hardware with one subgroup per workgroup and 2 rows per workgroup, using a
+// subgroup-only reduction; matching that shape measures ~16-19% faster end to end on
+// Nemotron (q5_0-dominated) and is neutral-to-positive on dense q4_K/q5_K models.
+// Set GGML_CUDA_MMVQ_CFG=0 to restore the upstream launch geometry.
 static int ggml_cuda_mmvq_cfg() {
     static const int cfg = [] {
         const char * s = getenv("GGML_CUDA_MMVQ_CFG");
@@ -1074,6 +1113,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int device = ggml_cuda_get_device();
     const int                     cc        = ggml_cuda_info().devices[device].cc;
 #if defined(GGML_MMVQ_WAVE64)
+    // This translation unit is compiled with -mwavefrontsize64, so the kernels in
+    // it run 64-wide regardless of what the device reports as its default wave
+    // size. The host launch geometry must match the device, not the device default.
     const int warp_size = 64;
     GGML_UNUSED(device);
 #else

@@ -87,6 +87,17 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+# Experimental: compile only the quantized mat-vec kernels for wave64.
+# Wave size is a per-kernel property on RDNA, so mixing wave32 and wave64
+# kernels in one binary is legal. The WMMA _w32 intrinsics used by fattn/mmq
+# mandate wave32, so those files must stay at the default.
+if (GGML_HIP_MMVQ_WAVE64)
+    set_source_files_properties(../ggml-cuda/mmvq.cu PROPERTIES
+        COMPILE_OPTIONS     "-mwavefrontsize64"
+        COMPILE_DEFINITIONS "GGML_MMVQ_WAVE64=1")
+    message(STATUS "ggml-hip: mmvq.cu will be compiled for wave64")
+endif()
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
