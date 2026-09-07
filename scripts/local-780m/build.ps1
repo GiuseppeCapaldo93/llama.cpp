@@ -29,6 +29,13 @@
   Build only; do not copy the ROCm runtime into build\bin.
 .PARAMETER Targets
   Optional list of CMake targets (default: everything).
+.PARAMETER Tests
+  Also build the test suite (LLAMA_BUILD_TESTS=ON). Use a separate -BuildDir, e.g.
+    .\build.ps1 -Tests -BuildDir build-tests -Targets test-backend-ops,llama-bench
+  then run:  build-tests\bin\test-backend-ops.exe -b ROCm0 -o MAMBA2_POST_FUSION
+.PARAMETER Wave64Mmvq
+  Experimental: compile mmvq.cu for wave64 (GGML_HIP_MMVQ_WAVE64=ON). Measured
+  -6.97% on gfx1103 with upstream launch geometry; kept for experiments only.
 #>
 [CmdletBinding()]
 param(
@@ -38,6 +45,8 @@ param(
     [int]      $Jobs        = [Environment]::ProcessorCount,
     [switch]   $Reconfigure,
     [switch]   $SkipDeploy,
+    [switch]   $Tests,
+    [switch]   $Wave64Mmvq,
     [string[]] $Targets     = @()
 )
 
@@ -96,7 +105,8 @@ $cfgArgs = @(
     "-DGGML_NATIVE=ON",
     "-DGGML_OPENMP=ON",
     "-DBUILD_SHARED_LIBS=ON",
-    "-DLLAMA_BUILD_TESTS=OFF",
+    "-DLLAMA_BUILD_TESTS=$(if ($Tests) { 'ON' } else { 'OFF' })",
+    "-DGGML_HIP_MMVQ_WAVE64=$(if ($Wave64Mmvq) { 'ON' } else { 'OFF' })",
     "-DLLAMA_BUILD_EXAMPLES=ON",
     "-DLLAMA_BUILD_SERVER=ON",
     "-DLLAMA_CURL=OFF"
@@ -117,7 +127,8 @@ $cmd = "call `"$vcvars`" -vcvars_ver=14.44 >nul 2>&1 && " +
 if ($LASTEXITCODE -ne 0) { throw "configure/build failed (exit $LASTEXITCODE)" }
 
 $bin = Join-Path $build "bin"
-if (-not (Test-Path (Join-Path $bin "llama-server.exe"))) { throw "llama-server.exe not produced in $bin" }
+$expected = if ($Targets.Count -gt 0) { "$($Targets[0]).exe" } else { "llama-server.exe" }
+if (-not (Test-Path (Join-Path $bin $expected))) { throw "$expected not produced in $bin" }
 Write-Host "BUILD OK -> $bin"
 
 if ($SkipDeploy) { return }
