@@ -3464,6 +3464,73 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Mamba2 decode tail:
+    //   cont(z), view(y_ssm), x*d, y_ssm + x*d, silu(z) * (...)
+    // The views are contiguous for single-token decode, so all four kernels can
+    // be replaced by one without changing the graph used for prompt processing.
+    if (ggml_can_fuse_subgraph(
+            cgraph, i,
+            { GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_GLU },
+            { i + 1, i + 4 })) {
+        ggml_tensor * cont   = cgraph->nodes[i + 0];
+        ggml_tensor * y_view = cgraph->nodes[i + 1];
+        ggml_tensor * mul    = cgraph->nodes[i + 2];
+        ggml_tensor * add    = cgraph->nodes[i + 3];
+        ggml_tensor * glu    = cgraph->nodes[i + 4];
+
+        const ggml_tensor * x = nullptr;
+        const ggml_tensor * d = nullptr;
+        if (ggml_are_same_shape(mul, mul->src[0])) {
+            x = mul->src[0];
+            d = mul->src[1];
+        } else if (ggml_are_same_shape(mul, mul->src[1])) {
+            x = mul->src[1];
+            d = mul->src[0];
+        }
+
+        const auto is_flat_f32_decode = [](const ggml_tensor * t) {
+            return t != nullptr &&
+                   t->type == GGML_TYPE_F32 &&
+                   t->ne[2] == 1 && t->ne[3] == 1 &&
+                   t->nb[0] == sizeof(float) &&
+                   t->nb[1] == (size_t) t->ne[0] * sizeof(float);
+        };
+
+        const bool edges_ok =
+            y_view->src[0] != nullptr &&
+            ((add->src[0] == y_view && add->src[1] == mul) ||
+             (add->src[1] == y_view && add->src[0] == mul)) &&
+            glu->src[0] == cont && glu->src[1] == add;
+
+        const bool shapes_ok =
+            x != nullptr && d != nullptr &&
+            ggml_are_same_shape(cont, y_view) &&
+            ggml_are_same_shape(cont, mul) &&
+            ggml_are_same_shape(cont, add) &&
+            ggml_are_same_shape(cont, glu) &&
+            d->ne[0] == 1 && d->ne[1] == glu->ne[1] &&
+            d->ne[2] == 1 && d->ne[3] == 1;
+
+        const bool layout_ok =
+            is_flat_f32_decode(cont->src[0]) &&
+            is_flat_f32_decode(y_view) &&
+            is_flat_f32_decode(x) &&
+            is_flat_f32_decode(glu) &&
+            d->type == GGML_TYPE_F32 &&
+            d->nb[0] == sizeof(float) && d->nb[1] == sizeof(float);
+
+        const bool glu_ok =
+            ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            ggml_get_op_params_i32(glu, 1) == 0;
+
+        const int out_nodes[] = { i + 4 };
+        if (edges_ok && shapes_ok && layout_ok && glu_ok &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
+            ggml_cuda_op_mamba2_post(*cuda_ctx, cont, y_view, mul, glu);
+            return 4;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;

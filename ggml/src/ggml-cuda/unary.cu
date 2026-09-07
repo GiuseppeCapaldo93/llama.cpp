@@ -37,6 +37,62 @@ static __device__ __forceinline__ float op_silu(float x) {
     return ggml_cuda_op_silu_single(x);
 }
 
+static __global__ void mamba2_post_fused_kernel(
+        const float * z,
+        const float * y,
+        const float * x,
+        const float * d,
+        float * dst,
+        int64_t n,
+        int64_t head_dim,
+        int64_t n_head) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t i_head = (i / head_dim) % n_head;
+    const float scaled = x[i] * d[i_head];
+    const float mixed = y[i] + scaled;
+    dst[i] = op_silu(z[i]) * mixed;
+}
+
+void ggml_cuda_op_mamba2_post(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * cont,
+        ggml_tensor * y_view,
+        ggml_tensor * mul,
+        ggml_tensor * glu) {
+    const ggml_tensor * z = cont->src[0];
+
+    const ggml_tensor * x = nullptr;
+    const ggml_tensor * d = nullptr;
+    if (ggml_are_same_shape(mul, mul->src[0])) {
+        x = mul->src[0];
+        d = mul->src[1];
+    } else {
+        x = mul->src[1];
+        d = mul->src[0];
+    }
+
+    const int64_t n = ggml_nelements(glu);
+    const int64_t blocks = (n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params(
+        (dim3) blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(
+        mamba2_post_fused_kernel,
+        launch_params,
+        (const float *) z->data,
+        (const float *) y_view->data,
+        (const float *) x->data,
+        (const float *) d->data,
+        (float *) glu->data,
+        n,
+        glu->ne[0],
+        glu->ne[1]);
+}
+
 static __device__ __forceinline__ float op_tanh(float x) {
     return tanhf(x);
 }
