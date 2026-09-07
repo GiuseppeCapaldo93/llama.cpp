@@ -338,6 +338,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize,
                       device_vram_mib);
+
+        // On an integrated GPU the CPU and the GPU share a single power/thermal budget.
+        // ROCclr enables "active wait" by default (hip_context.cpp: SetActiveWait(true)),
+        // so every synchronization spins a CPU core. On a discrete card that only costs
+        // idle CPU, but on an APU the spinning core consumes package power that the GPU
+        // would otherwise use for its own clocks, which lowers sustained token throughput.
+        // llama.cpp's Vulkan backend blocks on fences instead and uses ~2.4x less CPU here.
+        //
+        // Default to blocking sync on integrated devices; GGML_CUDA_ACTIVE_WAIT=1 restores
+        // the spinning behaviour.
+        {
+            const char * env = getenv("GGML_CUDA_ACTIVE_WAIT");
+            const bool force_spin = env != nullptr && atoi(env) != 0;
+            if (prop.integrated && !force_spin) {
+                CUDA_CHECK(hipSetDevice(physical_id));
+                CUDA_CHECK(hipSetDeviceFlags(hipDeviceScheduleBlockingSync));
+                GGML_LOG_INFO("  Device %d: integrated GPU, using blocking sync to preserve power budget\n", id);
+            }
+        }
 #elif defined(GGML_USE_MUSA)
         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
         info.devices[id].warp_size = 32;
